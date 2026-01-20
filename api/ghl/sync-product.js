@@ -5,14 +5,14 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v5";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v6_NO_PUT";
 
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API live (final v5).",
+      message: "DB Engine API live (v6 no PUT).",
     });
   }
 
@@ -39,19 +39,10 @@ export default async function handler(req, res) {
   const locationId = String(body.locationId || envLocationId || "").trim();
 
   if (!token) {
-    return res.status(500).json({
-      ok: false,
-      error: "Missing GHL token (env GHL_TOKEN or Authorization header).",
-      build: BUILD_MARKER,
-    });
+    return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Missing GHL token" });
   }
-
   if (!locationId) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing locationId (body.locationId or env GHL_LOCATION_ID).",
-      build: BUILD_MARKER,
-    });
+    return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing locationId" });
   }
 
   const altId = String(locationId);
@@ -79,11 +70,7 @@ export default async function handler(req, res) {
 
     const text = await resp.text();
     let data;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = text;
-    }
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
 
     if (!resp.ok) {
       const err = new Error(`GHL ${resp.status}`);
@@ -92,7 +79,6 @@ export default async function handler(req, res) {
       err.url = url;
       throw err;
     }
-
     return data;
   }
 
@@ -107,27 +93,22 @@ export default async function handler(req, res) {
   const sku = body.sku ? String(body.sku).trim() : null;
   const productType = String(body.productType || "PHYSICAL").trim();
 
-  if (!name) {
-    return res.status(400).json({ ok: false, error: "Missing required field: name", build: BUILD_MARKER });
-  }
-  if (!collectionName) {
-    return res.status(400).json({ ok: false, error: "Missing required field: collectionName", build: BUILD_MARKER });
-  }
+  if (!name) return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing name" });
+  if (!collectionName) return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing collectionName" });
 
   try {
+    // Resolve collection
     const colRes = await ghlFetch("/products/collections");
     const collections = colRes?.collections || colRes?.data || colRes || [];
-
-    const matched = collections.find(
+    const matched = (Array.isArray(collections) ? collections : []).find(
       (c) => String(c?.name || "").trim().toLowerCase() === collectionName.toLowerCase()
     );
     const resolvedCollectionId = extractCollectionId(matched);
-
     if (!resolvedCollectionId) {
       return res.status(404).json({
         ok: false,
-        error: `Collection not found: ${collectionName}`,
         build: BUILD_MARKER,
+        error: `Collection not found: ${collectionName}`,
         debug: {
           tokenPrefix,
           locationId,
@@ -139,47 +120,30 @@ export default async function handler(req, res) {
       });
     }
 
-    // CREATE (include both locationId and altId/altType for tenant quirks)
+    // Create product WITH collection included; no PUT step
     const created = await ghlFetch("/products/", {
       method: "POST",
       json: {
         locationId,
-        altId,
-        altType,
         productType,
         name,
         description: description || undefined,
         image: image || undefined,
         sku: sku || undefined,
+
+        // attempt all known collection fields
+        collectionId: String(resolvedCollectionId),
+        assignedCollectionId: String(resolvedCollectionId),
+        collectionIds: [String(resolvedCollectionId)],
       },
     });
 
     const productId = created?.product?.id || created?.product?._id || created?.id || created?._id;
     if (!productId) {
-      return res.status(500).json({
-        ok: false,
-        build: BUILD_MARKER,
-        error: "Product created but ID missing in response.",
-        created,
-      });
+      return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Created product but ID missing", created });
     }
 
-    // UPDATE/ASSIGN (send locationId + altId/altType redundantly)
-    await ghlFetch(`/products/${productId}`, {
-      method: "PUT",
-      json: {
-        locationId,
-        altId,
-        altType,
-        productType,
-        name,
-        description: description || undefined,
-        image: image || undefined,
-        sku: sku || undefined,
-        collectionIds: [String(resolvedCollectionId)],
-      },
-    });
-
+    // Verify
     const verified = await ghlFetch(`/products/${productId}`, { method: "GET" });
 
     return res.status(201).json({
@@ -189,6 +153,7 @@ export default async function handler(req, res) {
       collection: { name: collectionName, id: String(resolvedCollectionId) },
       debug: { tokenPrefix, locationId, productType },
       verified,
+      note: "No PUT used. Collection assignment attempted on create payload.",
     });
   } catch (err) {
     return res.status(err.status || 500).json({
@@ -196,12 +161,7 @@ export default async function handler(req, res) {
       build: BUILD_MARKER,
       error: err.message,
       details: err.data || null,
-      debug: {
-        tokenPrefix,
-        locationId,
-        productType,
-        ghlUrl: err.url || null,
-      },
+      debug: { tokenPrefix, locationId, productType, ghlUrl: err.url || null },
     });
   }
 }
