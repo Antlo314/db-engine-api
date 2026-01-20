@@ -1,17 +1,23 @@
 // File: /api/ghl/sync-product.js
-// DB ENGINE CANONICAL v10 + OPTIONAL UPSERT (SKU/externalId) + MULTI-IMAGE SUPPORT BASE
+// DB ENGINE CANONICAL v10 + UPSERT + MULTI-IMAGE + COMPARE-AT + INVENTORY + SEO + PRICE DEDUPE
 //
-// Baseline behavior unchanged unless you pass: { upsert: true, sku: "..."} (or externalId)
-// - If upsert is NOT true -> always creates a new product (exactly like v10)
-// - If upsert IS true and a key exists -> updates existing product + price instead of creating duplicates
-// - Optional mapping store using Vercel KV (@vercel/kv). If not configured, we fallback to a "tagged name" strategy.
-//   Recommended: set KV_REST_API_URL + KV_REST_API_TOKEN in Vercel env (from Vercel KV / Upstash)
+// Baseline preserved:
+// - If upsert !== true -> behaves like v10 (always creates new product, creates new price if provided)
+// - If upsert === true -> dedupe product by SKU/externalId and enforce single active price per SKU
+//
+// Optional KV mapping (recommended):
+// - If @vercel/kv is available + KV env configured, store mapping: dedupeKey -> { productId, priceId }
+// - If not, fallback to tagged product name strategy: "[DBE:<key>] <name>" so it can be found again.
+//
+// Tenant variability:
+// - Price PUT may not be supported. In that case, we dedupe by deleting old price (if delete supported) then create.
+// - Inventory fields may not be supported; we attempt best-effort fields and ignore if rejected.
+// - SEO fields tenant-dependent; best-effort.
 
 let kv = null;
 async function getKV() {
   if (kv) return kv;
   try {
-    // Lazy import so this file still deploys even if @vercel/kv isn't installed yet
     const mod = await import("@vercel/kv");
     kv = mod.kv;
     return kv;
@@ -29,7 +35,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
 
   const BUILD_MARKER =
-    "DB_ENGINE_API_BUILD_2026-01-20_CANONICAL_v10_QP_LOCATIONID__UPSERT_SKU_v1";
+    "DB_ENGINE_API_BUILD_2026-01-20_CANONICAL_v10_QP_LOCATIONID__ALL_EXCEPT_EBAY_v1";
 
   // Health check
   if (req.method === "GET") {
@@ -38,9 +44,13 @@ export default async function handler(req, res) {
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
       message: "DB Engine API is live. Use POST with JSON body.",
-      upsert: {
-        supported: true,
-        note: "Pass { upsert:true, sku:'...', externalId:'...' } to prevent duplicates.",
+      features: {
+        upsert: true,
+        multiImages: true,
+        compareAt: true,
+        inventoryBestEffort: true,
+        seoBestEffort: true,
+        priceDedupe: true,
       },
     });
   }
@@ -83,9 +93,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // Tenant requirement:
-  // - altId + altType MUST be query params
-  // - locationId MUST ALSO be on query params
+  // Tenant requirement: altId + altType + locationId MUST be query params
   const altType = "location";
   const altId = locationId;
 
@@ -95,7 +103,7 @@ export default async function handler(req, res) {
     const u = new URL(url);
     u.searchParams.set("altId", altId);
     u.searchParams.set("altType", altType);
-    u.searchParams.set("locationId", locationId); // CRITICAL FIX
+    u.searchParams.set("locationId", locationId);
     return u.toString();
   }
 
@@ -166,127 +174,45 @@ export default async function handler(req, res) {
     return id ? { ...hit, __resolvedId: String(id) } : { ...hit, __resolvedId: null };
   }
 
-  // ---------- Product update (full payload required on your tenant) ----------
-  async function putProduct(productId, payload) {
-    return await ghlFetch(`/products/${productId}`, { method: "PUT", json: payload });
-  }
-
+  // ---------- Products ----------
   async function createProduct(payload) {
     return await ghlFetch(`/products/`, { method: "POST", json: payload });
   }
+  async function putProduct(productId, payload) {
+    return await ghlFetch(`/products/${productId}`, { method: "PUT", json: payload });
+  }
+  async function getProduct(productId) {
+    return await ghlFetch(`/products/${productId}`, { method: "GET" });
+  }
 
-  // ---------- Price create / update ----------
+  // ---------- Prices ----------
   async function createPrice(productId, pricePayload) {
     return await ghlFetch(`/products/${productId}/price`, {
       method: "POST",
       json: pricePayload,
     });
   }
-
-  // Some tenants expose PUT /products/:productId/price/:priceId. If your tenant rejects it,
-  // we will fallback to creating a new price (but that can create duplicates).
   async function putPrice(productId, priceId, payload) {
     return await ghlFetch(`/products/${productId}/price/${priceId}`, {
       method: "PUT",
       json: payload,
     });
   }
-
   async function listPrices(productId) {
-    // Best-effort: some tenants support GET /products/:productId/price
-    // If unsupported, it will throw; we'll handle upstream.
     return await ghlFetch(`/products/${productId}/price`, { method: "GET" });
   }
-
-  async function getProduct(productId) {
-    return await ghlFetch(`/products/${productId}`, { method: "GET" });
-  }
-
-  // ---------- Inputs ----------
-  const rawName = String(body.name || "").trim();
-  const description = String(body.description || "").trim(); // plain text only, no HTML
-  const collectionName = String(body.collectionName || body.collection || "").trim();
-
-  // Single-image legacy
-  const image = String(body.image || body.imageUrl || "").trim();
-
-  // Multi-image support (optional, non-breaking)
-  // Accept: images: [url1,url2,...] or medias: [{url,title,type,isFeatured}, ...]
-  const imagesArr = Array.isArray(body.images)
-    ? body.images.map((u) => String(u || "").trim()).filter(Boolean)
-    : [];
-
-  const providedMedias = Array.isArray(body.medias) ? body.medias : null;
-
-  const availableInStore = body.availableInStore === false ? false : true; // default true
-  const productType = String(body.productType || "PHYSICAL").trim().toUpperCase();
-
-  // Price inputs: allow { price: { amount, compareAt, currency, sku, ... } } OR legacy flat price/amount
-  const priceObj =
-    body && typeof body.price === "object" && body.price !== null ? body.price : null;
-
-  const priceAmount =
-    priceObj?.amount ?? body.price ?? body.amount ?? null;
-
-  const compareAt =
-    priceObj?.compareAt ?? body.compareAt ?? body.compareAtPrice ?? null;
-
-  const currency = String(priceObj?.currency || body.currency || "USD").trim();
-  const priceType = String(priceObj?.type || body.priceType || "one_time").trim();
-
-  // Optional SEO best-effort (tenant dependent)
-  const seoTitle = String(body.seoTitle || "").trim();
-  const seoDescription = String(body.seoDescription || "").trim();
-
-  // --- UPSERT controls (optional) ---
-  const upsert = body.upsert === true;
-
-  // Upsert keys
-  const sku = String(body.sku || priceObj?.sku || "").trim();
-  const externalId = String(body.externalId || body.upc || body.upsertKey || "").trim();
-
-  // Dedupe key priority: sku > externalId
-  const dedupeKeyRaw = sku || externalId;
-  const dedupeKey = dedupeKeyRaw ? dedupeKeyRaw.toLowerCase() : "";
-
-  if (!rawName) {
-    return res.status(400).json({
-      ok: false,
-      build: BUILD_MARKER,
-      error: "Missing required field: name",
-    });
-  }
-  if (!collectionName) {
-    return res.status(400).json({
-      ok: false,
-      build: BUILD_MARKER,
-      error: "Missing required field: collectionName",
+  async function deletePrice(productId, priceId) {
+    // Tenant-dependent. If unsupported, it will throw.
+    return await ghlFetch(`/products/${productId}/price/${priceId}`, {
+      method: "DELETE",
     });
   }
 
-  // If user requests upsert but provides no key, fail early (to avoid accidental duplicates)
-  if (upsert && !dedupeKey) {
-    return res.status(400).json({
-      ok: false,
-      build: BUILD_MARKER,
-      error:
-        "Upsert requested but no dedupe key provided. Include sku or externalId (or upc/upsertKey).",
-    });
-  }
-
-  // ---- Name strategy for fallback (no KV) ----
-  // Only used when upsert:true AND KV is not available/configured.
-  // We do NOT change user-facing names in baseline create mode.
+  // ---------- Fallback product search (no KV) ----------
   const TAG_PREFIX = "DBE";
-  const taggedName = dedupeKey ? `[${TAG_PREFIX}:${dedupeKey}] ${rawName}` : rawName;
-
-  // ---- Optional: list products + find by taggedName (fallback) ----
   async function listProductsByNameSearch(searchTerm) {
-    // Best-effort endpoint: /products?search=... (not guaranteed on every tenant).
-    // If not supported, this will throw. We'll handle upstream.
     const u = new URL(`${API_BASE}/products/`);
     u.searchParams.set("search", String(searchTerm || "").slice(0, 64));
-    // Inject tenant params via withTenantParams
     const url = withTenantParams(u.toString());
 
     const resp = await fetch(url, {
@@ -313,20 +239,78 @@ export default async function handler(req, res) {
       err.url = url;
       throw err;
     }
-    const arr = data?.products || data?.data || data?.items || (Array.isArray(data) ? data : []);
+
+    const arr =
+      data?.products || data?.data || data?.items || (Array.isArray(data) ? data : []);
     return Array.isArray(arr) ? arr : [];
   }
-
   function normalizeProductId(p) {
     return p?._id || p?.id || p?.productId || null;
   }
 
-  // ---- Media building ----
+  // ---------- Inputs ----------
+  const rawName = String(body.name || "").trim();
+  const description = String(body.description || "").trim();
+  const collectionName = String(body.collectionName || body.collection || "").trim();
+
+  // media inputs
+  const image = String(body.image || body.imageUrl || "").trim();
+  const imagesArr = Array.isArray(body.images)
+    ? body.images.map((u) => String(u || "").trim()).filter(Boolean)
+    : [];
+  const providedMedias = Array.isArray(body.medias) ? body.medias : null;
+
+  const availableInStore = body.availableInStore === false ? false : true;
+  const productType = String(body.productType || "PHYSICAL").trim().toUpperCase();
+
+  // SEO best-effort
+  const seoTitle = String(body.seoTitle || "").trim();
+  const seoDescription = String(body.seoDescription || "").trim();
+  const seoSlug = String(body.seoSlug || body.slug || "").trim();
+
+  // Inventory best-effort
+  // (Different tenants use different fields; we try a safe set and ignore if rejected)
+  const trackInventory =
+    body.trackInventory === true || body.inventoryTracking === true;
+  const availableQty =
+    body.availableQty ?? body.qty ?? body.inventory ?? body.stock ?? null;
+
+  // Pricing
+  const priceObj =
+    body && typeof body.price === "object" && body.price !== null ? body.price : null;
+
+  const priceAmount =
+    priceObj?.amount ?? body.price ?? body.amount ?? null;
+  const compareAt =
+    priceObj?.compareAt ?? body.compareAt ?? body.compareAtPrice ?? null;
+  const currency = String(priceObj?.currency || body.currency || "USD").trim();
+  const priceType = String(priceObj?.type || body.priceType || "one_time").trim();
+
+  // Upsert controls
+  const upsert = body.upsert === true;
+  const sku = String(body.sku || priceObj?.sku || "").trim();
+  const externalId = String(body.externalId || body.upc || body.upsertKey || "").trim();
+
+  const dedupeKeyRaw = sku || externalId;
+  const dedupeKey = dedupeKeyRaw ? dedupeKeyRaw.toLowerCase() : "";
+
+  if (!rawName) {
+    return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing required field: name" });
+  }
+  if (!collectionName) {
+    return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing required field: collectionName" });
+  }
+  if (upsert && !dedupeKey) {
+    return res.status(400).json({
+      ok: false,
+      build: BUILD_MARKER,
+      error: "Upsert requested but no dedupe key provided. Include sku or externalId (or upc/upsertKey).",
+    });
+  }
+
+  const taggedName = dedupeKey ? `[${TAG_PREFIX}:${dedupeKey}] ${rawName}` : rawName;
+
   function buildMediasPayload() {
-    // Priority order:
-    // 1) if medias array provided -> normalize and keep
-    // 2) else if images[] provided -> convert
-    // 3) else if legacy image -> single featured
     if (providedMedias && providedMedias.length) {
       const cleaned = providedMedias
         .map((m, idx) => {
@@ -342,7 +326,6 @@ export default async function handler(req, res) {
           };
         })
         .filter(Boolean);
-
       return cleaned.length ? cleaned : undefined;
     }
 
@@ -358,17 +341,21 @@ export default async function handler(req, res) {
 
     if (image) {
       return [
-        {
-          id: crypto.randomUUID(),
-          title: rawName,
-          url: image,
-          type: "image",
-          isFeatured: true,
-        },
+        { id: crypto.randomUUID(), title: rawName, url: image, type: "image", isFeatured: true },
       ];
     }
 
     return undefined;
+  }
+
+  // Helper: find existing price by SKU in returned list
+  function normalizePriceId(p) {
+    return p?._id || p?.id || p?.priceId || null;
+  }
+  function extractPricesArray(pricesResp) {
+    const arr =
+      pricesResp?.prices || pricesResp?.data || pricesResp?.items || (Array.isArray(pricesResp) ? pricesResp : []);
+    return Array.isArray(arr) ? arr : [];
   }
 
   try {
@@ -385,22 +372,19 @@ export default async function handler(req, res) {
           tokenPrefix,
           locationId,
           altType,
-          collectionsSeen: collections.slice(0, 25).map((c) => ({
-            name: c?.name,
-            id: normalizeCollectionId(c),
-          })),
+          collectionsSeen: collections.slice(0, 25).map((c) => ({ name: c?.name, id: normalizeCollectionId(c) })),
         },
       });
     }
 
     const resolvedCollectionId = matched.__resolvedId;
 
+    // 2) Media + featured image
     const mediasPayload = buildMediasPayload();
     const featuredImageUrl =
       mediasPayload?.find((m) => m?.isFeatured)?.url || image || imagesArr[0] || "";
 
-    // 2) Build product payload (baseline: v10)
-    // IMPORTANT: your tenant requires FULL payload on PUT.
+    // 3) Build product payload (FULL payload for PUT)
     const baseProductPayload = {
       name: rawName,
       description: description || undefined,
@@ -412,34 +396,39 @@ export default async function handler(req, res) {
       medias: mediasPayload,
     };
 
+    // SEO best-effort fields
     if (seoTitle) baseProductPayload.seoTitle = seoTitle;
     if (seoDescription) baseProductPayload.seoDescription = seoDescription;
+    if (seoSlug) baseProductPayload.seoSlug = seoSlug;
 
-    // 3) UPSERT RESOLUTION
-    // Strategy:
-    // - If upsert:true, attempt KV lookup -> update existing
-    // - Else fallback search by tagged name -> update existing (only if we previously created tagged products)
-    // - Else create new product (v10 baseline)
+    // Inventory best-effort fields on product (tenant dependent)
+    // We do NOT hard-fail if tenant rejects these; they simply won't apply.
+    if (trackInventory === true) baseProductPayload.trackInventory = true;
+    if (availableQty !== null && availableQty !== undefined && String(availableQty).trim() !== "") {
+      const q = Number(availableQty);
+      if (Number.isFinite(q) && q >= 0) {
+        baseProductPayload.availableQuantity = q;
+        baseProductPayload.quantity = q; // some tenants use "quantity"
+      }
+    }
+
+    // 4) UPSERT RESOLUTION
     const kvClient = await getKV();
-
     const kvKey = dedupeKey ? `dbe:map:${locationId}:${dedupeKey}` : null;
 
     async function kvGetMap() {
       if (!kvClient || !kvKey) return null;
       try {
         const val = await kvClient.get(kvKey);
-        // expected: { productId, priceId }
         if (val && typeof val === "object") return val;
         return null;
       } catch {
         return null;
       }
     }
-
     async function kvSetMap(obj) {
       if (!kvClient || !kvKey) return false;
       try {
-        // Persist indefinitely. You can add TTL later if desired.
         await kvClient.set(kvKey, obj);
         return true;
       } catch {
@@ -449,16 +438,17 @@ export default async function handler(req, res) {
 
     let mode = "create";
     let map = null;
-    let existingProductId = null;
+    let productId = null;
     let existingPriceId = null;
 
     if (upsert) {
       map = await kvGetMap();
-      existingProductId = map?.productId ? String(map.productId) : null;
-      existingPriceId = map?.priceId ? String(map.priceId) : null;
-
-      if (!existingProductId && !kvClient) {
-        // Fallback: attempt to find by tagged name
+      if (map?.productId) {
+        productId = String(map.productId);
+        existingPriceId = map?.priceId ? String(map.priceId) : null;
+        mode = "update";
+      } else if (!kvClient) {
+        // fallback search by tagged name
         try {
           const products = await listProductsByNameSearch(`[${TAG_PREFIX}:${dedupeKey}]`);
           const hit =
@@ -467,43 +457,30 @@ export default async function handler(req, res) {
             null;
 
           const pid = hit ? normalizeProductId(hit) : null;
-          if (pid) existingProductId = String(pid);
+          if (pid) {
+            productId = String(pid);
+            mode = "update";
+          }
         } catch {
-          // ignore search failure; we will create
+          // ignore
         }
       }
-
-      if (existingProductId) mode = "update";
     }
 
-    // 4) Create or Update product
+    // 5) Create/Update product
     let created = null;
     let enforced = null;
-    let productId = null;
 
     if (mode === "update") {
-      productId = existingProductId;
-
-      // Update product (PUT full payload). Name behavior:
-      // - If KV-backed update, we keep the clean name (rawName).
-      // - If fallback-tagged update (no KV), we keep tagged name to remain searchable.
-      const putPayload =
-        !kvClient
-          ? { ...baseProductPayload, name: taggedName }
-          : { ...baseProductPayload, name: rawName };
-
+      const putPayload = !kvClient ? { ...baseProductPayload, name: taggedName } : baseProductPayload;
       try {
         enforced = await putProduct(String(productId), putPayload);
       } catch (e) {
         enforced = { __error: true, status: e?.status || 500, details: e?.data || null };
       }
     } else {
-      // CREATE MODE (baseline v10). Name remains clean unless:
-      // - upsert:true AND no KV configured -> we create taggedName so we can find it later
       const createPayload =
-        upsert && !kvClient
-          ? { ...baseProductPayload, name: taggedName }
-          : { ...baseProductPayload, name: rawName };
+        upsert && !kvClient ? { ...baseProductPayload, name: taggedName } : baseProductPayload;
 
       created = await createProduct(createPayload);
 
@@ -522,33 +499,26 @@ export default async function handler(req, res) {
         });
       }
 
-      // Enforce store toggle + collection via PUT (FULL REQUIRED PAYLOAD)
+      // enforce with PUT (full payload)
       try {
-        enforced = await putProduct(String(productId), {
-          ...(upsert && !kvClient ? { ...baseProductPayload, name: taggedName } : baseProductPayload),
-        });
+        enforced = await putProduct(String(productId), createPayload);
       } catch (e) {
         enforced = { __error: true, status: e?.status || 500, details: e?.data || null };
       }
     }
 
-    // 5) Price create / update (if provided)
+    // 6) Price logic + de-dupe
     let priceResp = null;
     let priceAction = "none";
+    let priceDedupe = { attempted: false, deleted: [], errors: [] };
 
     const hasPrice =
-      priceAmount !== null &&
-      priceAmount !== undefined &&
-      String(priceAmount).trim() !== "";
+      priceAmount !== null && priceAmount !== undefined && String(priceAmount).trim() !== "";
 
     if (hasPrice) {
       const amountNum = Number(priceAmount);
       if (!Number.isFinite(amountNum) || amountNum < 0) {
-        return res.status(400).json({
-          ok: false,
-          build: BUILD_MARKER,
-          error: "Invalid price. Provide a numeric price >= 0.",
-        });
+        return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Invalid price. Provide a numeric price >= 0." });
       }
 
       const compareAtNum =
@@ -557,14 +527,9 @@ export default async function handler(req, res) {
           : null;
 
       if (compareAtNum !== null && (!Number.isFinite(compareAtNum) || compareAtNum < 0)) {
-        return res.status(400).json({
-          ok: false,
-          build: BUILD_MARKER,
-          error: "Invalid compareAt price. Provide a numeric compareAt >= 0.",
-        });
+        return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Invalid compareAt price. Provide a numeric compareAt >= 0." });
       }
 
-      // Build price payload
       const pricePayload = {
         product: String(productId),
         locationId,
@@ -574,64 +539,75 @@ export default async function handler(req, res) {
         amount: amountNum,
         description: description || undefined,
       };
-
-      // sku is supported on price objects; include when provided
       if (sku) pricePayload.sku = sku;
-
-      // compareAt support is tenant-dependent; include only if provided
       if (compareAtNum !== null) pricePayload.compareAt = compareAtNum;
 
-      if (mode === "update" && existingPriceId) {
-        // Try to update existing price
+      if (upsert && sku) {
+        // Always enforce single active price per SKU in upsert mode
+        priceDedupe.attempted = true;
+
+        // List prices and delete duplicates (best-effort)
+        let existingPrices = [];
+        try {
+          const pricesResp = await listPrices(String(productId));
+          existingPrices = extractPricesArray(pricesResp);
+        } catch (e) {
+          priceDedupe.errors.push({
+            stage: "listPrices",
+            status: e?.status || 500,
+            details: e?.data || null,
+          });
+          existingPrices = [];
+        }
+
+        const skuLower = sku.toLowerCase();
+        const matches = existingPrices.filter(
+          (p) => String(p?.sku || "").trim().toLowerCase() === skuLower
+        );
+
+        // Delete every matching price (we will recreate the latest one).
+        // This avoids needing PUT support for price update on restrictive tenants.
+        for (const p of matches) {
+          const pid = normalizePriceId(p);
+          if (!pid) continue;
+          try {
+            await deletePrice(String(productId), String(pid));
+            priceDedupe.deleted.push(String(pid));
+          } catch (e) {
+            priceDedupe.errors.push({
+              stage: "deletePrice",
+              priceId: String(pid),
+              status: e?.status || 500,
+              details: e?.data || null,
+            });
+          }
+        }
+
+        // Create fresh price
+        priceAction = "dedupe_delete_then_create";
+        try {
+          priceResp = await createPrice(String(productId), pricePayload);
+        } catch (e) {
+          priceResp = { __error: true, status: e?.status || 500, details: e?.data || null };
+          priceAction = "failed";
+        }
+      } else if (mode === "update" && existingPriceId) {
+        // Try to update mapped priceId (if tenant supports PUT)
         priceAction = "update";
         try {
           priceResp = await putPrice(String(productId), String(existingPriceId), pricePayload);
         } catch (e) {
-          // Fallback: try to locate a price by SKU (if listing is supported)
-          let foundPriceId = null;
-          if (sku) {
-            try {
-              const prices = await listPrices(String(productId));
-              const arr = prices?.prices || prices?.data || prices?.items || (Array.isArray(prices) ? prices : []);
-              const list = Array.isArray(arr) ? arr : [];
-              const hit =
-                list.find((p) => String(p?.sku || "").trim().toLowerCase() === sku.toLowerCase()) ||
-                null;
-              const pid = hit?._id || hit?.id || null;
-              if (pid) foundPriceId = String(pid);
-            } catch {
-              // ignore
-            }
-          }
-
-          if (foundPriceId) {
-            try {
-              priceResp = await putPrice(String(productId), String(foundPriceId), pricePayload);
-              existingPriceId = foundPriceId;
-              priceAction = "update_by_sku";
-            } catch (e2) {
-              // Final fallback: create new price (may create duplicates if tenant doesn't support price update)
-              try {
-                priceResp = await createPrice(String(productId), pricePayload);
-                priceAction = "create_fallback_after_failed_update";
-              } catch (e3) {
-                priceResp = { __error: true, status: e3?.status || 500, details: e3?.data || null };
-                priceAction = "failed";
-              }
-            }
-          } else {
-            // Create as fallback
-            try {
-              priceResp = await createPrice(String(productId), pricePayload);
-              priceAction = "create_fallback_after_failed_update";
-            } catch (e3) {
-              priceResp = { __error: true, status: e3?.status || 500, details: e3?.data || null };
-              priceAction = "failed";
-            }
+          // Fallback create
+          try {
+            priceResp = await createPrice(String(productId), pricePayload);
+            priceAction = "create_fallback_after_failed_update";
+          } catch (e2) {
+            priceResp = { __error: true, status: e2?.status || 500, details: e2?.data || null };
+            priceAction = "failed";
           }
         }
       } else {
-        // Create price (v10 baseline)
+        // Baseline create
         priceAction = "create";
         try {
           priceResp = await createPrice(String(productId), pricePayload);
@@ -642,13 +618,11 @@ export default async function handler(req, res) {
       }
     }
 
-    // 6) Persist mapping (KV) when upsert requested and we have a dedupe key
-    // We only persist when we can confidently identify productId and (optionally) priceId.
+    // 7) Persist mapping (KV) if upsert and key present
     let mapping = null;
     let mappingSaved = false;
 
     if (upsert && dedupeKey) {
-      // Extract priceId from responses if present
       const priceId =
         priceResp?.price?._id ||
         priceResp?.price?.id ||
@@ -664,7 +638,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 7) Verify
+    // 8) Verify
     const verified = await getProduct(String(productId));
     const productObj = verified?.product || verified || null;
 
@@ -687,6 +661,20 @@ export default async function handler(req, res) {
         availableInStoreRequested: availableInStore,
         availableInStoreSeenOnGet: productObj?.availableInStore ?? null,
       },
+      media: {
+        featured: featuredImageUrl || null,
+        count: Array.isArray(mediasPayload) ? mediasPayload.length : 0,
+      },
+      inventory: {
+        trackInventoryRequested: trackInventory === true,
+        qtyRequested: availableQty ?? null,
+      },
+      seo: {
+        seoTitleRequested: seoTitle || null,
+        seoDescriptionRequested: seoDescription || null,
+        seoSlugRequested: seoSlug || null,
+      },
+      priceDedupe,
       price: priceResp,
       verified: productObj,
       debug: {
@@ -695,8 +683,6 @@ export default async function handler(req, res) {
         productType,
         ghlUrlSample: withTenantParams(`${API_BASE}/products/${productId}`),
       },
-      created,
-      enforced,
     });
   } catch (err) {
     const status = err?.status || 500;
