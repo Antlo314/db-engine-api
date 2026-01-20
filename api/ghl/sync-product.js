@@ -1,13 +1,12 @@
 // File: /api/ghl/sync-product.js
 export default async function handler(req, res) {
-  // Basic CORS
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-19_v2";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL";
 
   // Health check
   if (req.method === "GET") {
@@ -15,7 +14,7 @@ export default async function handler(req, res) {
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API is live. Use POST with JSON body.",
+      message: "DB Engine API live (final).",
     });
   }
 
@@ -23,7 +22,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // --- Safe body parsing (Vercel can pass string) ---
+  // Parse body safely
   let body = {};
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
@@ -31,272 +30,187 @@ export default async function handler(req, res) {
     body = {};
   }
 
-  // --- ENV ---
   const API_BASE = "https://services.leadconnectorhq.com";
   const VERSION = "2021-07-28";
 
-  // Token comes from env OR Authorization header (helps ReqBin testing)
+  // Token: env first, then header
   const envToken = process.env.GHL_TOKEN || "";
-  const headerAuth = String(req.headers.authorization || "").trim();
-  const headerToken = headerAuth.toLowerCase().startsWith("bearer ")
-    ? headerAuth.slice(7).trim()
+  const headerAuth = String(req.headers.authorization || "");
+  const headerToken = headerAuth.startsWith("Bearer ")
+    ? headerAuth.slice(7)
     : "";
+  const token = String(envToken || headerToken).trim();
 
-  const token = String(envToken || headerToken || "").trim();
   const envLocationId = process.env.GHL_LOCATION_ID;
-
-  // Prefer request locationId if provided; otherwise env
   const locationId = String(body.locationId || envLocationId || "").trim();
 
   if (!token) {
     return res.status(500).json({
       ok: false,
-      error: "Missing token. Set env var GHL_TOKEN or pass Authorization: Bearer <token>.",
+      error: "Missing GHL token",
       build: BUILD_MARKER,
     });
   }
+
   if (!locationId) {
     return res.status(400).json({
       ok: false,
-      error:
-        "Missing locationId. Provide locationId in JSON body or set env var GHL_LOCATION_ID.",
+      error: "Missing locationId",
       build: BUILD_MARKER,
     });
   }
 
-  const altType = "location";
   const altId = String(locationId);
-
-  // --- Helpers ---
-  const tokenPrefix = String(token).slice(0, 12);
+  const altType = "location";
+  const tokenPrefix = token.slice(0, 10);
 
   function withAlt(url) {
     const u = new URL(url);
-    u.searchParams.set("altId", String(altId));
-    u.searchParams.set("altType", String(altType));
+    u.searchParams.set("altId", altId);
+    u.searchParams.set("altType", altType);
     return u.toString();
   }
 
   async function ghlFetch(path, { method = "GET", json } = {}) {
     const url = withAlt(`${API_BASE}${path}`);
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      Version: VERSION,
-      "Content-Type": "application/json",
-    };
-
     const resp = await fetch(url, {
       method,
-      headers,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Version: VERSION,
+        "Content-Type": "application/json",
+      },
       body: json ? JSON.stringify(json) : undefined,
     });
 
     const text = await resp.text();
-    let data = null;
+    let data;
     try {
       data = text ? JSON.parse(text) : null;
     } catch {
-      data = text || null;
+      data = text;
     }
 
     if (!resp.ok) {
-      const err = new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      const err = new Error(`GHL ${resp.status}`);
       err.status = resp.status;
       err.data = data;
-      err.ghlUrl = url; // very useful debug
+      err.url = url;
       throw err;
     }
 
     return data;
   }
 
-  function pickAssignedCollectionId(productPayload) {
-    const p = productPayload?.product || productPayload || {};
+  function extractCollectionId(c) {
     return (
-      p.assignedCollectionId ||
-      p.collectionId ||
-      (Array.isArray(p.collectionIds) ? p.collectionIds[0] : null) ||
-      (Array.isArray(p.collectionIds?.data) ? p.collectionIds.data[0] : null) ||
+      c?.id ||
+      c?._id ||
+      c?.collectionId ||
+      c?.collection_id ||
+      c?.uuid ||
       null
     );
   }
 
-  async function fetchCollections() {
-    const data = await ghlFetch(`/products/collections`, { method: "GET" });
-    const arr =
-      data?.collections ||
-      data?.data ||
-      data?.items ||
-      (Array.isArray(data) ? data : []);
-    return Array.isArray(arr) ? arr : [];
-  }
-
-  function findCollectionByName(collections, collectionName) {
-    const target = String(collectionName || "").trim().toLowerCase();
-    if (!target) return null;
-
-    let hit =
-      collections.find(
-        (c) => String(c?.name || "").trim().toLowerCase() === target
-      ) || null;
-
-    if (!hit) {
-      hit =
-        collections.find((c) =>
-          String(c?.name || "").trim().toLowerCase().includes(target)
-        ) || null;
-    }
-    return hit;
-  }
-
-  async function enforceCollection(productId, collectionId) {
-    const attempts = [
-      { collectionIds: [String(collectionId)] },
-      { collectionId: String(collectionId) },
-      { assignedCollectionId: String(collectionId) },
-    ];
-
-    let lastErr = null;
-    for (const payload of attempts) {
-      try {
-        return await ghlFetch(`/products/${productId}`, {
-          method: "PUT",
-          json: payload,
-        });
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-    throw lastErr || new Error("Failed to enforce collection assignment");
-  }
-
-  // --- Inputs ---
   const name = String(body.name || "").trim();
   const description = String(body.description || "").trim();
-  const image = String(body.image || body.imageUrl || "").trim();
+  const image = String(body.image || "").trim();
   const collectionName = String(body.collectionName || "").trim();
   const sku = body.sku ? String(body.sku).trim() : null;
 
-  if (!name) {
+  if (!name || !collectionName) {
     return res.status(400).json({
       ok: false,
-      error: "Missing required field: name",
-      build: BUILD_MARKER,
-    });
-  }
-  if (!collectionName) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing required field: collectionName",
+      error: "Missing name or collectionName",
       build: BUILD_MARKER,
     });
   }
 
   try {
-    // 1) Resolve collection
-    const collections = await fetchCollections();
-    const matched = findCollectionByName(collections, collectionName);
+    // 1) Get collections
+    const colRes = await ghlFetch("/products/collections");
+    const collections =
+      colRes?.collections || colRes?.data || colRes || [];
 
-    if (!matched?.id) {
+    const matched = collections.find(
+      (c) =>
+        String(c?.name || "").trim().toLowerCase() ===
+        collectionName.toLowerCase()
+    );
+
+    const resolvedCollectionId = extractCollectionId(matched);
+
+    if (!resolvedCollectionId) {
       return res.status(404).json({
         ok: false,
-        error: `Collection not found for name: "${collectionName}"`,
+        error: `Collection not found: ${collectionName}`,
         build: BUILD_MARKER,
         debug: {
-          tokenPrefix,
-          locationId,
-          altType,
-          collectionsSeen: collections.slice(0, 10).map((c) => ({
-            id: c?.id,
+          collectionsSeen: collections.map((c) => ({
             name: c?.name,
+            id: extractCollectionId(c),
           })),
         },
       });
     }
 
-    const resolvedCollectionId = String(matched.id);
-
     // 2) Create product
-    const createPayload = {
-      name,
-      description: description || undefined,
-      image: image || undefined,
-      sku: sku || undefined,
-      collectionId: resolvedCollectionId,
-      assignedCollectionId: resolvedCollectionId,
-      collectionIds: [resolvedCollectionId],
-    };
-
-    const created = await ghlFetch(`/products/`, {
+    const created = await ghlFetch("/products/", {
       method: "POST",
-      json: createPayload,
+      json: {
+        name,
+        description: description || undefined,
+        image: image || undefined,
+        sku: sku || undefined,
+      },
     });
 
     const productId =
-      created?.product?._id ||
       created?.product?.id ||
-      created?._id ||
-      created?.id;
+      created?.product?._id ||
+      created?.id ||
+      created?._id;
 
     if (!productId) {
-      return res.status(500).json({
-        ok: false,
-        error: "Created product but could not find productId in response",
-        build: BUILD_MARKER,
-        created,
-      });
+      throw new Error("Product created but ID missing");
     }
 
-    // 3) Enforce collection AFTER create
-    const enforcedResponse = await enforceCollection(
-      String(productId),
-      resolvedCollectionId
-    );
-
-    // 4) Verify
-    const verifiedProduct = await ghlFetch(`/products/${productId}`, {
-      method: "GET",
+    // 3) Enforce collection
+    await ghlFetch(`/products/${productId}`, {
+      method: "PUT",
+      json: {
+        collectionIds: [resolvedCollectionId],
+      },
     });
 
-    const assigned = pickAssignedCollectionId(verifiedProduct);
-    const verified = String(assigned || "") === String(resolvedCollectionId);
+    // 4) Verify
+    const verified = await ghlFetch(`/products/${productId}`);
 
     return res.status(201).json({
       ok: true,
       build: BUILD_MARKER,
-      ghlProductId: String(productId),
-      collection: {
-        resolvedCollectionId,
-        collectionName,
-      },
-      enforced: true,
-      verified,
-      assignedCollectionIdSeenOnGet: assigned || null,
+      productId,
+      collectionName,
+      verifiedCollectionId:
+        verified?.collectionIds?.[0] ||
+        verified?.assignedCollectionId ||
+        null,
       debug: {
         tokenPrefix,
         locationId,
-        altType,
-        apiBase: API_BASE,
-        version: VERSION,
       },
-      created,
-      enforcedResponse,
     });
   } catch (err) {
-    const status = err?.status || 500;
-    return res.status(status).json({
+    return res.status(err.status || 500).json({
       ok: false,
       build: BUILD_MARKER,
-      error: err?.message || "Unknown error",
-      status,
-      details: err?.data || null,
+      error: err.message,
+      details: err.data || null,
       debug: {
         tokenPrefix,
         locationId,
-        altType,
-        apiBase: API_BASE,
-        version: VERSION,
-        ghlUrl: err?.ghlUrl || null,
+        ghlUrl: err.url || null,
       },
     });
   }
