@@ -5,14 +5,14 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v6_NO_PUT";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v7_QP_LOCATIONID";
 
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API live (v6 no PUT).",
+      message: "DB Engine API live (v7 query includes locationId).",
     });
   }
 
@@ -38,26 +38,24 @@ export default async function handler(req, res) {
   const envLocationId = process.env.GHL_LOCATION_ID;
   const locationId = String(body.locationId || envLocationId || "").trim();
 
-  if (!token) {
-    return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Missing GHL token" });
-  }
-  if (!locationId) {
-    return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing locationId" });
-  }
+  if (!token) return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Missing GHL token" });
+  if (!locationId) return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing locationId" });
 
   const altId = String(locationId);
   const altType = "location";
   const tokenPrefix = token.slice(0, 10);
 
-  function withAlt(url) {
+  // IMPORTANT: this tenant requires locationId in query params too
+  function withTenantQuery(url) {
     const u = new URL(url);
     u.searchParams.set("altId", altId);
     u.searchParams.set("altType", altType);
+    u.searchParams.set("locationId", altId);
     return u.toString();
   }
 
   async function ghlFetch(path, { method = "GET", json } = {}) {
-    const url = withAlt(`${API_BASE}${path}`);
+    const url = withTenantQuery(`${API_BASE}${path}`);
     const resp = await fetch(url, {
       method,
       headers: {
@@ -97,12 +95,14 @@ export default async function handler(req, res) {
   if (!collectionName) return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing collectionName" });
 
   try {
-    // Resolve collection
+    // 1) Resolve collection
     const colRes = await ghlFetch("/products/collections");
     const collections = colRes?.collections || colRes?.data || colRes || [];
+
     const matched = (Array.isArray(collections) ? collections : []).find(
       (c) => String(c?.name || "").trim().toLowerCase() === collectionName.toLowerCase()
     );
+
     const resolvedCollectionId = extractCollectionId(matched);
     if (!resolvedCollectionId) {
       return res.status(404).json({
@@ -120,7 +120,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Create product WITH collection included; no PUT step
+    // 2) Create product (include locationId + productType)
     const created = await ghlFetch("/products/", {
       method: "POST",
       json: {
@@ -130,8 +130,7 @@ export default async function handler(req, res) {
         description: description || undefined,
         image: image || undefined,
         sku: sku || undefined,
-
-        // attempt all known collection fields
+        // attempt collection attach at create time
         collectionId: String(resolvedCollectionId),
         assignedCollectionId: String(resolvedCollectionId),
         collectionIds: [String(resolvedCollectionId)],
@@ -143,7 +142,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Created product but ID missing", created });
     }
 
-    // Verify
+    // 3) Verify (this is where you were failing; now includes locationId in query)
     const verified = await ghlFetch(`/products/${productId}`, { method: "GET" });
 
     return res.status(201).json({
@@ -153,7 +152,6 @@ export default async function handler(req, res) {
       collection: { name: collectionName, id: String(resolvedCollectionId) },
       debug: { tokenPrefix, locationId, productType },
       verified,
-      note: "No PUT used. Collection assignment attempted on create payload.",
     });
   } catch (err) {
     return res.status(err.status || 500).json({
@@ -161,7 +159,12 @@ export default async function handler(req, res) {
       build: BUILD_MARKER,
       error: err.message,
       details: err.data || null,
-      debug: { tokenPrefix, locationId, productType, ghlUrl: err.url || null },
+      debug: {
+        tokenPrefix,
+        locationId,
+        productType,
+        ghlUrl: err.url || null,
+      },
     });
   }
 }
