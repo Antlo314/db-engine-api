@@ -1,12 +1,13 @@
 // File: /api/ghl/sync-product.js
 export default async function handler(req, res) {
-  // CORS
+  // Basic CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Version");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_CANONICAL_v8_STORE_PRICE";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_CANONICAL_v9_STORE_PRICE_MEDIA";
 
   // Health check
   if (req.method === "GET") {
@@ -14,15 +15,15 @@ export default async function handler(req, res) {
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API live (v8 canonical). Use POST with JSON body.",
+      message: "DB Engine API is live. Use POST with JSON body.",
     });
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed", build: BUILD_MARKER });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // Safe JSON parse
+  // --- Safe body parsing (Vercel can pass string) ---
   let body = {};
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
@@ -30,47 +31,56 @@ export default async function handler(req, res) {
     body = {};
   }
 
+  // --- ENV ---
   const API_BASE = "https://services.leadconnectorhq.com";
   const VERSION = "2021-07-28";
 
   const token = process.env.GHL_TOKEN;
   const envLocationId = process.env.GHL_LOCATION_ID;
+
+  // Prefer request locationId if provided; otherwise env
   const locationId = String(body.locationId || envLocationId || "").trim();
 
   if (!token) {
-    return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Missing env var: GHL_TOKEN" });
+    return res.status(500).json({
+      ok: false,
+      error: "Missing env var: GHL_TOKEN",
+      build: BUILD_MARKER,
+    });
   }
   if (!locationId) {
     return res.status(400).json({
       ok: false,
+      error: "Missing locationId. Provide locationId in JSON body or set env var GHL_LOCATION_ID.",
       build: BUILD_MARKER,
-      error: "Missing locationId. Provide locationId in body or set env var GHL_LOCATION_ID.",
     });
   }
 
-  // Tenant quirks: MUST be on querystring for your account
-  const altId = locationId;
+  // GHL requirement you already proved: altId/altType MUST be query params
   const altType = "location";
-  const tokenPrefix = String(token).slice(0, 10);
+  const altId = locationId;
 
-  function withTenantQuery(url) {
+  // --- Helpers ---
+  const tokenPrefix = String(token).slice(0, 12);
+
+  function withAlt(url) {
     const u = new URL(url);
     u.searchParams.set("altId", altId);
     u.searchParams.set("altType", altType);
-    // critical for your tenant (this was the v7 fix)
-    u.searchParams.set("locationId", altId);
     return u.toString();
   }
 
   async function ghlFetch(path, { method = "GET", json } = {}) {
-    const url = withTenantQuery(`${API_BASE}${path}`);
+    const url = withAlt(`${API_BASE}${path}`);
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Version: VERSION,
+      "Content-Type": "application/json",
+    };
+
     const resp = await fetch(url, {
       method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Version: VERSION,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: json ? JSON.stringify(json) : undefined,
     });
 
@@ -86,203 +96,263 @@ export default async function handler(req, res) {
       const err = new Error(`GHL ${resp.status}`);
       err.status = resp.status;
       err.data = data;
-      err.url = url;
       throw err;
     }
+
     return data;
   }
 
-  // ---------- Collections ----------
-  function normalizeCollectionsResponse(data) {
-    return data?.collections || data?.data || data?.items || (Array.isArray(data) ? data : []);
+  async function fetchCollections() {
+    const data = await ghlFetch(`/products/collections`, { method: "GET" });
+
+    const arr =
+      data?.collections ||
+      data?.data ||
+      data?.items ||
+      (Array.isArray(data) ? data : []);
+
+    return Array.isArray(arr) ? arr : [];
   }
 
-  function getCollectionId(c) {
-    return c?.id || c?._id || c?.collectionId || c?.uuid || null;
+  function normalizeCollectionId(c) {
+    return c?.id || c?._id || c?.collectionId || null;
   }
 
   function findCollectionByName(collections, collectionName) {
     const target = String(collectionName || "").trim().toLowerCase();
     if (!target) return null;
 
-    let hit = collections.find((c) => String(c?.name || "").trim().toLowerCase() === target) || null;
+    // Exact match
+    let hit =
+      collections.find(
+        (c) => String(c?.name || "").trim().toLowerCase() === target
+      ) || null;
+
+    // Fallback: includes match
     if (!hit) {
-      hit = collections.find((c) => String(c?.name || "").trim().toLowerCase().includes(target)) || null;
-    }
-    return hit;
-  }
-
-  // ---------- Store include ----------
-  async function enforceIncludeInOnlineStore(productId) {
-    // Best-effort: try common flags across tenants
-    const attempts = [
-      { isAvailableInStore: true },
-      { availableInStore: true },
-      { isVisibleInStore: true },
-      { visibleInStore: true },
-      { includedInStore: true },
-      { isIncludedInStore: true },
-      { includeInOnlineStore: true }, // matches UI label wording
-    ];
-
-    let lastErr = null;
-    for (const payload of attempts) {
-      try {
-        return await ghlFetch(`/products/${productId}`, { method: "PUT", json: payload });
-      } catch (e) {
-        lastErr = e;
-      }
+      hit =
+        collections.find((c) =>
+          String(c?.name || "").trim().toLowerCase().includes(target)
+        ) || null;
     }
 
-    return { ok: false, note: "Unable to set include-in-store via flags", lastErr: lastErr?.data || null };
+    if (!hit) return null;
+
+    const id = normalizeCollectionId(hit);
+    return id ? { ...hit, __resolvedId: String(id) } : { ...hit, __resolvedId: null };
   }
 
-  // ---------- Simple price ----------
-  async function enforceSimplePrice(productId, priceNumber) {
-    // GHL often wants price in cents OR structured fields; we try several safe variants.
-    // We keep it best-effort so it never breaks product creation.
-    const price = Number(priceNumber);
-    if (!Number.isFinite(price) || price < 0) return { ok: false, note: "No valid price provided" };
-
-    const attempts = [
-      { price },                         // some tenants accept
-      { defaultPrice: price },            // some tenants accept
-      { amount: price },                  // some tenants accept
-      { priceAmount: price },             // some tenants accept
-      { priceInCents: Math.round(price * 100) }, // some tenants accept
-      // Some tenants store in "variants" even for single-price; try a minimal variant:
-      { variants: [{ name: "Default", price }] },
-    ];
-
-    let lastErr = null;
-    for (const payload of attempts) {
-      try {
-        return await ghlFetch(`/products/${productId}`, { method: "PUT", json: payload });
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-
-    return { ok: false, note: "Unable to set price via PUT attempts", lastErr: lastErr?.data || null };
+  async function enforceProductUpdate(productId, payload) {
+    // IMPORTANT: GHL update endpoint often validates required fields.
+    // So we always include name/locationId/productType when we PUT.
+    return await ghlFetch(`/products/${productId}`, {
+      method: "PUT",
+      json: payload,
+    });
   }
 
-  // ---------- Inputs ----------
+  async function createPrice(productId, pricePayload) {
+    // Official Prices endpoint: POST /products/:productId/price
+    return await ghlFetch(`/products/${productId}/price`, {
+      method: "POST",
+      json: pricePayload,
+    });
+  }
+
+  async function getProduct(productId) {
+    return await ghlFetch(`/products/${productId}`, { method: "GET" });
+  }
+
+  // --- Inputs (plain text description; NO HTML) ---
   const name = String(body.name || "").trim();
-  const description = String(body.description || "").trim();
-  const image = String(body.image || body.imageUrl || "").trim();
+  const description = String(body.description || "").trim(); // user requirement: plain text only
   const collectionName = String(body.collectionName || body.collection || "").trim();
-  const sku = body.sku ? String(body.sku).trim() : undefined;
 
-  // Required by your tenant in earlier 422s
-  const productType = String(body.productType || "PHYSICAL").trim().toUpperCase();
+  // optional
+  const image = String(body.image || body.imageUrl || "").trim();
+  const medias = Array.isArray(body.medias) ? body.medias : null;
 
-  // simple price
-  const price = body.price ?? body.amount ?? body.defaultPrice;
+  // optional price
+  const priceAmount = body.price ?? body.amount ?? null; // number
+  const currency = String(body.currency || "USD").trim();
+  const priceType = String(body.priceType || "one_time").trim(); // one_time | recurring
 
-  if (!name) return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing required field: name" });
+  // optional SEO best-effort (tenant dependent)
+  const seoTitle = String(body.seoTitle || "").trim();
+  const seoDescription = String(body.seoDescription || "").trim();
+
+  if (!name) {
+    return res.status(400).json({ ok: false, error: "Missing required field: name", build: BUILD_MARKER });
+  }
   if (!collectionName) {
-    return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing required field: collectionName" });
+    return res.status(400).json({ ok: false, error: "Missing required field: collectionName", build: BUILD_MARKER });
   }
 
+  // GHL doc calls this "availableInStore"
+  const availableInStore = body.availableInStore === false ? false : true; // default true
+
+  // Product type: PHYSICAL is your default use case
+  const productType = String(body.productType || "PHYSICAL").trim();
+
+  // --- Run ---
   try {
-    // 1) Resolve collection id
-    const colRes = await ghlFetch(`/products/collections`, { method: "GET" });
-    const collections = normalizeCollectionsResponse(colRes);
-    const matched = findCollectionByName(Array.isArray(collections) ? collections : [], collectionName);
+    // 1) Resolve collection id by name
+    const collections = await fetchCollections();
+    const matched = findCollectionByName(collections, collectionName);
 
-    const resolvedCollectionId = matched ? getCollectionId(matched) : null;
-
-    if (!resolvedCollectionId) {
+    if (!matched?.__resolvedId) {
       return res.status(404).json({
         ok: false,
-        error: `Collection not found for name: "${collectionName}"`,
+        error: `Collection not found (or missing id) for name: "${collectionName}"`,
         build: BUILD_MARKER,
         debug: {
           tokenPrefix,
           locationId,
           altType,
-          collectionsSeen: (Array.isArray(collections) ? collections : []).slice(0, 25).map((c) => ({
+          collectionsSeen: collections.slice(0, 25).map((c) => ({
+            id: normalizeCollectionId(c),
             name: c?.name,
-            id: c?.id,
-            _id: c?._id,
-            extractedId: getCollectionId(c),
           })),
         },
       });
     }
 
-    // 2) Create product (include collection fields on create)
+    const resolvedCollectionId = matched.__resolvedId;
+
+    // 2) Build medias payload (official format)
+    // If user gave medias array, use it; otherwise build from image.
+    const mediasPayload =
+      (Array.isArray(medias) && medias.length)
+        ? medias
+        : (image
+            ? [
+                {
+                  id: crypto.randomUUID(),
+                  title: name,
+                  url: image,
+                  type: "image",
+                  isFeatured: true,
+                },
+              ]
+            : undefined);
+
+    // 3) Create product
     const createPayload = {
-      locationId,
-      productType,
       name,
       description: description || undefined,
+      locationId,
+      productType,
+      availableInStore, // << key for “Include in Online store” :contentReference[oaicite:3]{index=3}
       image: image || undefined,
-      sku,
-
-      // collection attempt
-      collectionId: String(resolvedCollectionId),
-      assignedCollectionId: String(resolvedCollectionId),
-      collectionIds: [String(resolvedCollectionId)],
+      medias: mediasPayload,
+      // collections may or may not persist on create, but we still send them:
+      collectionIds: [resolvedCollectionId],
     };
+
+    // best-effort SEO fields (ignored if unsupported)
+    if (seoTitle) createPayload.seoTitle = seoTitle;
+    if (seoDescription) createPayload.seoDescription = seoDescription;
 
     const created = await ghlFetch(`/products/`, { method: "POST", json: createPayload });
 
     const productId =
-      created?.product?._id || created?.product?.id || created?._id || created?.id;
+      created?.product?._id ||
+      created?.product?.id ||
+      created?._id ||
+      created?.id;
 
     if (!productId) {
       return res.status(500).json({
         ok: false,
-        build: BUILD_MARKER,
         error: "Created product but could not find productId in response",
+        build: BUILD_MARKER,
         created,
       });
     }
 
-    // 3) Verify
-    const verified1 = await ghlFetch(`/products/${productId}`, { method: "GET" });
+    // 4) Enforce collection + availableInStore via PUT (include required fields)
+    // NOTE: update endpoint can be strict; include name/locationId/productType.
+    let enforced = null;
+    try {
+      enforced = await enforceProductUpdate(String(productId), {
+        name,
+        locationId,
+        productType,
+        availableInStore,
+        collectionIds: [resolvedCollectionId],
+      });
+    } catch (e) {
+      enforced = { __error: true, status: e?.status || 500, details: e?.data || null };
+    }
 
-    // 4) Ensure included in online store (best-effort)
-    const storeResp = await enforceIncludeInOnlineStore(String(productId));
+    // 5) Create price (if provided)
+    let priceResp = null;
+    if (priceAmount !== null && priceAmount !== undefined && String(priceAmount).trim() !== "") {
+      const amountNum = Number(priceAmount);
+      if (!Number.isFinite(amountNum) || amountNum < 0) {
+        return res.status(400).json({
+          ok: false,
+          build: BUILD_MARKER,
+          error: "Invalid price. Provide a numeric price >= 0.",
+        });
+      }
 
-    // 5) Simple price (best-effort)
-    const priceResp = await enforceSimplePrice(String(productId), price);
+      // Per HighLevel support article, these are core fields :contentReference[oaicite:4]{index=4}
+      const pricePayload = {
+        product: String(productId),
+        locationId,
+        name: `${name} - Price`,
+        type: priceType,     // one_time | recurring
+        currency,            // USD
+        amount: amountNum,   // numeric
+        description: description || undefined,
+      };
 
-    // 6) Final verify
-    const verified2 = await ghlFetch(`/products/${productId}`, { method: "GET" });
+      try {
+        priceResp = await createPrice(String(productId), pricePayload);
+      } catch (e) {
+        priceResp = { __error: true, status: e?.status || 500, details: e?.data || null };
+      }
+    }
+
+    // 6) Verify
+    const verified = await getProduct(String(productId));
+
+    const finalCollectionIds =
+      verified?.product?.collectionIds ||
+      verified?.collectionIds ||
+      [];
+
+    const isInCollection = Array.isArray(finalCollectionIds)
+      ? finalCollectionIds.map(String).includes(String(resolvedCollectionId))
+      : false;
+
+    const finalAvailable =
+      verified?.product?.availableInStore ??
+      verified?.availableInStore ??
+      null;
 
     return res.status(201).json({
       ok: true,
       build: BUILD_MARKER,
       productId: String(productId),
-      collection: { name: matched?.name || collectionName, id: String(resolvedCollectionId) },
-      enforcement: {
-        includeInOnlineStore: storeResp || null,
-        price: priceResp || null,
-      },
-      verified: verified2?.product || verified2 || null,
-      debug: {
-        tokenPrefix,
-        locationId,
-        productType,
-        ghlUrlSample: withTenantQuery(`${API_BASE}/products/${productId}`),
-      },
+      collection: { name: collectionName, id: resolvedCollectionId },
+      store: { availableInStoreRequested: availableInStore, availableInStoreSeenOnGet: finalAvailable },
+      verified: { isInCollection },
+      price: priceResp,
+      debug: { tokenPrefix, locationId, productType },
       created,
-      initialVerified: verified1?.product || verified1 || null,
+      enforced,
     });
   } catch (err) {
-    return res.status(err.status || 500).json({
+    const status = err?.status || 500;
+    return res.status(status).json({
       ok: false,
       build: BUILD_MARKER,
-      error: err.message,
-      details: err.data || null,
-      debug: {
-        tokenPrefix,
-        locationId,
-        productType,
-        ghlUrl: err.url || null,
-      },
+      error: err?.message || "Unknown error",
+      status,
+      details: err?.data || null,
+      debug: { tokenPrefix, locationId, altType, apiBase: API_BASE, version: VERSION },
     });
   }
 }
