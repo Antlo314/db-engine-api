@@ -6,15 +6,14 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v3";
 
-  // Health check
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API live (final).",
+      message: "DB Engine API live (final v3).",
     });
   }
 
@@ -119,6 +118,9 @@ export default async function handler(req, res) {
   const collectionName = String(body.collectionName || "").trim();
   const sku = body.sku ? String(body.sku).trim() : null;
 
+  // allow overriding productType from request, default to PHYSICAL
+  const productType = String(body.productType || "PHYSICAL").trim();
+
   if (!name || !collectionName) {
     return res.status(400).json({
       ok: false,
@@ -155,10 +157,12 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2) Create product
+    // 2) Create product (tenant requires locationId + productType)
     const created = await ghlFetch("/products/", {
       method: "POST",
       json: {
+        locationId,          // REQUIRED by your tenant
+        productType,         // REQUIRED by your tenant (default PHYSICAL)
         name,
         description: description || undefined,
         image: image || undefined,
@@ -180,6 +184,8 @@ export default async function handler(req, res) {
     await ghlFetch(`/products/${productId}`, {
       method: "PUT",
       json: {
+        locationId,
+        productType,
         collectionIds: [resolvedCollectionId],
       },
     });
@@ -192,14 +198,13 @@ export default async function handler(req, res) {
       build: BUILD_MARKER,
       productId,
       collectionName,
-      verifiedCollectionId:
-        verified?.collectionIds?.[0] ||
-        verified?.assignedCollectionId ||
-        null,
+      resolvedCollectionId,
       debug: {
         tokenPrefix,
         locationId,
+        productType,
       },
+      verified,
     });
   } catch (err) {
     return res.status(err.status || 500).json({
