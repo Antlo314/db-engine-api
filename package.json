@@ -1,0 +1,7 @@
+{
+  "name": "db-engine-api",
+  "private": true,
+  "engines": {
+    "node": "18.x"
+  }
+}
