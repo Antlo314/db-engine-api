@@ -1,20 +1,18 @@
 // File: /api/ghl/sync-product.js
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v4";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v5";
 
-  // Health check
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API live (final v4).",
+      message: "DB Engine API live (final v5).",
     });
   }
 
@@ -22,7 +20,6 @@ export default async function handler(req, res) {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // Parse body safely
   let body = {};
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
@@ -33,12 +30,9 @@ export default async function handler(req, res) {
   const API_BASE = "https://services.leadconnectorhq.com";
   const VERSION = "2021-07-28";
 
-  // Token: env first, then header
   const envToken = process.env.GHL_TOKEN || "";
   const headerAuth = String(req.headers.authorization || "");
-  const headerToken = headerAuth.startsWith("Bearer ")
-    ? headerAuth.slice(7)
-    : "";
+  const headerToken = headerAuth.startsWith("Bearer ") ? headerAuth.slice(7) : "";
   const token = String(envToken || headerToken).trim();
 
   const envLocationId = process.env.GHL_LOCATION_ID;
@@ -103,53 +97,30 @@ export default async function handler(req, res) {
   }
 
   function extractCollectionId(c) {
-    return (
-      c?.id ||
-      c?._id ||
-      c?.collectionId ||
-      c?.collection_id ||
-      c?.uuid ||
-      null
-    );
+    return c?.id || c?._id || c?.collectionId || c?.collection_id || c?.uuid || null;
   }
 
-  // Inputs
   const name = String(body.name || "").trim();
   const description = String(body.description || "").trim();
   const image = String(body.image || "").trim();
   const collectionName = String(body.collectionName || "").trim();
   const sku = body.sku ? String(body.sku).trim() : null;
-
-  // Tenant-required field: productType (allow override; default PHYSICAL)
   const productType = String(body.productType || "PHYSICAL").trim();
 
   if (!name) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing required field: name",
-      build: BUILD_MARKER,
-    });
+    return res.status(400).json({ ok: false, error: "Missing required field: name", build: BUILD_MARKER });
   }
-
   if (!collectionName) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing required field: collectionName",
-      build: BUILD_MARKER,
-    });
+    return res.status(400).json({ ok: false, error: "Missing required field: collectionName", build: BUILD_MARKER });
   }
 
   try {
-    // 1) Fetch collections
     const colRes = await ghlFetch("/products/collections");
     const collections = colRes?.collections || colRes?.data || colRes || [];
 
     const matched = collections.find(
-      (c) =>
-        String(c?.name || "").trim().toLowerCase() ===
-        collectionName.toLowerCase()
+      (c) => String(c?.name || "").trim().toLowerCase() === collectionName.toLowerCase()
     );
-
     const resolvedCollectionId = extractCollectionId(matched);
 
     if (!resolvedCollectionId) {
@@ -160,21 +131,21 @@ export default async function handler(req, res) {
         debug: {
           tokenPrefix,
           locationId,
-          collectionsSeen: (Array.isArray(collections) ? collections : []).map(
-            (c) => ({
-              name: c?.name,
-              id: extractCollectionId(c),
-            })
-          ),
+          collectionsSeen: (Array.isArray(collections) ? collections : []).map((c) => ({
+            name: c?.name,
+            id: extractCollectionId(c),
+          })),
         },
       });
     }
 
-    // 2) Create product (tenant requires locationId + productType)
+    // CREATE (include both locationId and altId/altType for tenant quirks)
     const created = await ghlFetch("/products/", {
       method: "POST",
       json: {
         locationId,
+        altId,
+        altType,
         productType,
         name,
         description: description || undefined,
@@ -183,12 +154,7 @@ export default async function handler(req, res) {
       },
     });
 
-    const productId =
-      created?.product?.id ||
-      created?.product?._id ||
-      created?.id ||
-      created?._id;
-
+    const productId = created?.product?.id || created?.product?._id || created?.id || created?._id;
     if (!productId) {
       return res.status(500).json({
         ok: false,
@@ -198,14 +164,15 @@ export default async function handler(req, res) {
       });
     }
 
-    // 3) Enforce collection assignment
-    // IMPORTANT: your tenant requires name on PUT, so include it.
+    // UPDATE/ASSIGN (send locationId + altId/altType redundantly)
     await ghlFetch(`/products/${productId}`, {
       method: "PUT",
       json: {
         locationId,
+        altId,
+        altType,
         productType,
-        name, // REQUIRED by your tenant on PUT
+        name,
         description: description || undefined,
         image: image || undefined,
         sku: sku || undefined,
@@ -213,22 +180,14 @@ export default async function handler(req, res) {
       },
     });
 
-    // 4) Verify (best-effort)
     const verified = await ghlFetch(`/products/${productId}`, { method: "GET" });
 
     return res.status(201).json({
       ok: true,
       build: BUILD_MARKER,
       productId: String(productId),
-      collection: {
-        name: collectionName,
-        id: String(resolvedCollectionId),
-      },
-      debug: {
-        tokenPrefix,
-        locationId,
-        productType,
-      },
+      collection: { name: collectionName, id: String(resolvedCollectionId) },
+      debug: { tokenPrefix, locationId, productType },
       verified,
     });
   } catch (err) {
