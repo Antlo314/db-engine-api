@@ -7,7 +7,7 @@ export default async function handler(req, res) {
 
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_CANONICAL_v9_STORE_PRICE_MEDIA";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_CANONICAL_v10_QP_LOCATIONID";
 
   // Health check
   if (req.method === "GET") {
@@ -20,10 +20,10 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+    return res.status(405).json({ ok: false, error: "Method not allowed", build: BUILD_MARKER });
   }
 
-  // --- Safe body parsing (Vercel can pass string) ---
+  // --- Safe body parsing ---
   let body = {};
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
@@ -38,49 +38,45 @@ export default async function handler(req, res) {
   const token = process.env.GHL_TOKEN;
   const envLocationId = process.env.GHL_LOCATION_ID;
 
-  // Prefer request locationId if provided; otherwise env
   const locationId = String(body.locationId || envLocationId || "").trim();
 
   if (!token) {
-    return res.status(500).json({
-      ok: false,
-      error: "Missing env var: GHL_TOKEN",
-      build: BUILD_MARKER,
-    });
+    return res.status(500).json({ ok: false, build: BUILD_MARKER, error: "Missing env var: GHL_TOKEN" });
   }
   if (!locationId) {
     return res.status(400).json({
       ok: false,
-      error: "Missing locationId. Provide locationId in JSON body or set env var GHL_LOCATION_ID.",
       build: BUILD_MARKER,
+      error: "Missing locationId. Provide locationId in JSON body or set env var GHL_LOCATION_ID.",
     });
   }
 
-  // GHL requirement you already proved: altId/altType MUST be query params
+  // Your tenant requirement:
+  // - altId + altType MUST be query params
+  // - locationId MUST ALSO be on query params
   const altType = "location";
   const altId = locationId;
 
-  // --- Helpers ---
   const tokenPrefix = String(token).slice(0, 12);
 
-  function withAlt(url) {
+  function withTenantParams(url) {
     const u = new URL(url);
     u.searchParams.set("altId", altId);
     u.searchParams.set("altType", altType);
+    u.searchParams.set("locationId", locationId); // <-- CRITICAL FIX (your v7 success requirement)
     return u.toString();
   }
 
   async function ghlFetch(path, { method = "GET", json } = {}) {
-    const url = withAlt(`${API_BASE}${path}`);
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      Version: VERSION,
-      "Content-Type": "application/json",
-    };
+    const url = withTenantParams(`${API_BASE}${path}`);
 
     const resp = await fetch(url, {
       method,
-      headers,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Version: VERSION,
+        "Content-Type": "application/json",
+      },
       body: json ? JSON.stringify(json) : undefined,
     });
 
@@ -96,122 +92,93 @@ export default async function handler(req, res) {
       const err = new Error(`GHL ${resp.status}`);
       err.status = resp.status;
       err.data = data;
+      err.url = url;
       throw err;
     }
 
     return data;
   }
 
-  async function fetchCollections() {
-    const data = await ghlFetch(`/products/collections`, { method: "GET" });
-
-    const arr =
-      data?.collections ||
-      data?.data ||
-      data?.items ||
-      (Array.isArray(data) ? data : []);
-
-    return Array.isArray(arr) ? arr : [];
-  }
-
+  // ---------- Collections ----------
   function normalizeCollectionId(c) {
     return c?.id || c?._id || c?.collectionId || null;
+  }
+
+  async function fetchCollections() {
+    const data = await ghlFetch(`/products/collections`, { method: "GET" });
+    const arr = data?.collections || data?.data || data?.items || (Array.isArray(data) ? data : []);
+    return Array.isArray(arr) ? arr : [];
   }
 
   function findCollectionByName(collections, collectionName) {
     const target = String(collectionName || "").trim().toLowerCase();
     if (!target) return null;
 
-    // Exact match
-    let hit =
-      collections.find(
-        (c) => String(c?.name || "").trim().toLowerCase() === target
-      ) || null;
-
-    // Fallback: includes match
+    let hit = collections.find((c) => String(c?.name || "").trim().toLowerCase() === target) || null;
     if (!hit) {
-      hit =
-        collections.find((c) =>
-          String(c?.name || "").trim().toLowerCase().includes(target)
-        ) || null;
+      hit = collections.find((c) => String(c?.name || "").trim().toLowerCase().includes(target)) || null;
     }
-
     if (!hit) return null;
 
     const id = normalizeCollectionId(hit);
     return id ? { ...hit, __resolvedId: String(id) } : { ...hit, __resolvedId: null };
   }
 
-  async function enforceProductUpdate(productId, payload) {
-    // IMPORTANT: GHL update endpoint often validates required fields.
-    // So we always include name/locationId/productType when we PUT.
-    return await ghlFetch(`/products/${productId}`, {
-      method: "PUT",
-      json: payload,
-    });
+  // ---------- Product update (must be full payload on your tenant) ----------
+  async function putProduct(productId, payload) {
+    return await ghlFetch(`/products/${productId}`, { method: "PUT", json: payload });
   }
 
+  // ---------- Price create ----------
   async function createPrice(productId, pricePayload) {
-    // Official Prices endpoint: POST /products/:productId/price
-    return await ghlFetch(`/products/${productId}/price`, {
-      method: "POST",
-      json: pricePayload,
-    });
+    // Official endpoint per docs: POST /products/:productId/price
+    return await ghlFetch(`/products/${productId}/price`, { method: "POST", json: pricePayload });
   }
 
   async function getProduct(productId) {
     return await ghlFetch(`/products/${productId}`, { method: "GET" });
   }
 
-  // --- Inputs (plain text description; NO HTML) ---
+  // ---------- Inputs ----------
   const name = String(body.name || "").trim();
-  const description = String(body.description || "").trim(); // user requirement: plain text only
+  const description = String(body.description || "").trim(); // plain text only, no HTML
   const collectionName = String(body.collectionName || body.collection || "").trim();
 
-  // optional
   const image = String(body.image || body.imageUrl || "").trim();
-  const medias = Array.isArray(body.medias) ? body.medias : null;
 
-  // optional price
-  const priceAmount = body.price ?? body.amount ?? null; // number
+  const availableInStore = body.availableInStore === false ? false : true; // default true
+  const productType = String(body.productType || "PHYSICAL").trim().toUpperCase();
+
+  const priceAmount = body.price ?? body.amount ?? null;
   const currency = String(body.currency || "USD").trim();
-  const priceType = String(body.priceType || "one_time").trim(); // one_time | recurring
+  const priceType = String(body.priceType || "one_time").trim();
 
-  // optional SEO best-effort (tenant dependent)
+  // Optional SEO best-effort (tenant dependent)
   const seoTitle = String(body.seoTitle || "").trim();
   const seoDescription = String(body.seoDescription || "").trim();
 
-  if (!name) {
-    return res.status(400).json({ ok: false, error: "Missing required field: name", build: BUILD_MARKER });
-  }
+  if (!name) return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing required field: name" });
   if (!collectionName) {
-    return res.status(400).json({ ok: false, error: "Missing required field: collectionName", build: BUILD_MARKER });
+    return res.status(400).json({ ok: false, build: BUILD_MARKER, error: "Missing required field: collectionName" });
   }
 
-  // GHL doc calls this "availableInStore"
-  const availableInStore = body.availableInStore === false ? false : true; // default true
-
-  // Product type: PHYSICAL is your default use case
-  const productType = String(body.productType || "PHYSICAL").trim();
-
-  // --- Run ---
   try {
-    // 1) Resolve collection id by name
+    // 1) Resolve collection id
     const collections = await fetchCollections();
     const matched = findCollectionByName(collections, collectionName);
 
     if (!matched?.__resolvedId) {
       return res.status(404).json({
         ok: false,
-        error: `Collection not found (or missing id) for name: "${collectionName}"`,
         build: BUILD_MARKER,
+        error: `Collection not found (or missing id) for name: "${collectionName}"`,
         debug: {
           tokenPrefix,
           locationId,
           altType,
           collectionsSeen: collections.slice(0, 25).map((c) => ({
-            id: normalizeCollectionId(c),
             name: c?.name,
+            id: normalizeCollectionId(c),
           })),
         },
       });
@@ -219,22 +186,18 @@ export default async function handler(req, res) {
 
     const resolvedCollectionId = matched.__resolvedId;
 
-    // 2) Build medias payload (official format)
-    // If user gave medias array, use it; otherwise build from image.
-    const mediasPayload =
-      (Array.isArray(medias) && medias.length)
-        ? medias
-        : (image
-            ? [
-                {
-                  id: crypto.randomUUID(),
-                  title: name,
-                  url: image,
-                  type: "image",
-                  isFeatured: true,
-                },
-              ]
-            : undefined);
+    // 2) Build medias payload if image provided (GHL supports medias array on product) — best effort
+    const mediasPayload = image
+      ? [
+          {
+            id: crypto.randomUUID(),
+            title: name,
+            url: image,
+            type: "image",
+            isFeatured: true,
+          },
+        ]
+      : undefined;
 
     // 3) Create product
     const createPayload = {
@@ -242,14 +205,15 @@ export default async function handler(req, res) {
       description: description || undefined,
       locationId,
       productType,
-      availableInStore, // << key for “Include in Online store” :contentReference[oaicite:3]{index=3}
+      availableInStore,
+      // Collections
+      collectionIds: [resolvedCollectionId],
+      // Images
       image: image || undefined,
       medias: mediasPayload,
-      // collections may or may not persist on create, but we still send them:
-      collectionIds: [resolvedCollectionId],
     };
 
-    // best-effort SEO fields (ignored if unsupported)
+    // Best-effort SEO (if your tenant supports it)
     if (seoTitle) createPayload.seoTitle = seoTitle;
     if (seoDescription) createPayload.seoDescription = seoDescription;
 
@@ -264,22 +228,25 @@ export default async function handler(req, res) {
     if (!productId) {
       return res.status(500).json({
         ok: false,
-        error: "Created product but could not find productId in response",
         build: BUILD_MARKER,
+        error: "Created product but could not find productId in response",
         created,
       });
     }
 
-    // 4) Enforce collection + availableInStore via PUT (include required fields)
-    // NOTE: update endpoint can be strict; include name/locationId/productType.
+    // 4) Enforce store toggle + collection via PUT (FULL REQUIRED PAYLOAD)
+    // Your tenant rejects partial PUT. Always include name/locationId/productType.
     let enforced = null;
     try {
-      enforced = await enforceProductUpdate(String(productId), {
+      enforced = await putProduct(String(productId), {
         name,
+        description: description || undefined,
         locationId,
         productType,
         availableInStore,
         collectionIds: [resolvedCollectionId],
+        image: image || undefined,
+        medias: mediasPayload,
       });
     } catch (e) {
       enforced = { __error: true, status: e?.status || 500, details: e?.data || null };
@@ -297,14 +264,13 @@ export default async function handler(req, res) {
         });
       }
 
-      // Per HighLevel support article, these are core fields :contentReference[oaicite:4]{index=4}
       const pricePayload = {
         product: String(productId),
         locationId,
         name: `${name} - Price`,
-        type: priceType,     // one_time | recurring
-        currency,            // USD
-        amount: amountNum,   // numeric
+        type: priceType,
+        currency,
+        amount: amountNum,
         description: description || undefined,
       };
 
@@ -317,30 +283,25 @@ export default async function handler(req, res) {
 
     // 6) Verify
     const verified = await getProduct(String(productId));
-
-    const finalCollectionIds =
-      verified?.product?.collectionIds ||
-      verified?.collectionIds ||
-      [];
-
-    const isInCollection = Array.isArray(finalCollectionIds)
-      ? finalCollectionIds.map(String).includes(String(resolvedCollectionId))
-      : false;
-
-    const finalAvailable =
-      verified?.product?.availableInStore ??
-      verified?.availableInStore ??
-      null;
+    const productObj = verified?.product || verified || null;
 
     return res.status(201).json({
       ok: true,
       build: BUILD_MARKER,
       productId: String(productId),
-      collection: { name: collectionName, id: resolvedCollectionId },
-      store: { availableInStoreRequested: availableInStore, availableInStoreSeenOnGet: finalAvailable },
-      verified: { isInCollection },
+      collection: { name: matched?.name || collectionName, id: resolvedCollectionId },
+      store: {
+        availableInStoreRequested: availableInStore,
+        availableInStoreSeenOnGet: productObj?.availableInStore ?? null,
+      },
       price: priceResp,
-      debug: { tokenPrefix, locationId, productType },
+      verified: productObj,
+      debug: {
+        tokenPrefix,
+        locationId,
+        productType,
+        ghlUrlSample: withTenantParams(`${API_BASE}/products/${productId}`),
+      },
       created,
       enforced,
     });
@@ -352,7 +313,14 @@ export default async function handler(req, res) {
       error: err?.message || "Unknown error",
       status,
       details: err?.data || null,
-      debug: { tokenPrefix, locationId, altType, apiBase: API_BASE, version: VERSION },
+      debug: {
+        tokenPrefix,
+        locationId,
+        altType,
+        apiBase: API_BASE,
+        version: VERSION,
+        ghlUrl: err?.url || null,
+      },
     });
   }
 }
