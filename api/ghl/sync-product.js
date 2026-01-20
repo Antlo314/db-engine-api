@@ -6,14 +6,15 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v3";
+  const BUILD_MARKER = "DB_ENGINE_API_BUILD_2026-01-20_FINAL_v4";
 
+  // Health check
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       route: "/api/ghl/sync-product",
       build: BUILD_MARKER,
-      message: "DB Engine API live (final v3).",
+      message: "DB Engine API live (final v4).",
     });
   }
 
@@ -46,7 +47,7 @@ export default async function handler(req, res) {
   if (!token) {
     return res.status(500).json({
       ok: false,
-      error: "Missing GHL token",
+      error: "Missing GHL token (env GHL_TOKEN or Authorization header).",
       build: BUILD_MARKER,
     });
   }
@@ -54,7 +55,7 @@ export default async function handler(req, res) {
   if (!locationId) {
     return res.status(400).json({
       ok: false,
-      error: "Missing locationId",
+      error: "Missing locationId (body.locationId or env GHL_LOCATION_ID).",
       build: BUILD_MARKER,
     });
   }
@@ -112,28 +113,36 @@ export default async function handler(req, res) {
     );
   }
 
+  // Inputs
   const name = String(body.name || "").trim();
   const description = String(body.description || "").trim();
   const image = String(body.image || "").trim();
   const collectionName = String(body.collectionName || "").trim();
   const sku = body.sku ? String(body.sku).trim() : null;
 
-  // allow overriding productType from request, default to PHYSICAL
+  // Tenant-required field: productType (allow override; default PHYSICAL)
   const productType = String(body.productType || "PHYSICAL").trim();
 
-  if (!name || !collectionName) {
+  if (!name) {
     return res.status(400).json({
       ok: false,
-      error: "Missing name or collectionName",
+      error: "Missing required field: name",
+      build: BUILD_MARKER,
+    });
+  }
+
+  if (!collectionName) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing required field: collectionName",
       build: BUILD_MARKER,
     });
   }
 
   try {
-    // 1) Get collections
+    // 1) Fetch collections
     const colRes = await ghlFetch("/products/collections");
-    const collections =
-      colRes?.collections || colRes?.data || colRes || [];
+    const collections = colRes?.collections || colRes?.data || colRes || [];
 
     const matched = collections.find(
       (c) =>
@@ -149,10 +158,14 @@ export default async function handler(req, res) {
         error: `Collection not found: ${collectionName}`,
         build: BUILD_MARKER,
         debug: {
-          collectionsSeen: collections.map((c) => ({
-            name: c?.name,
-            id: extractCollectionId(c),
-          })),
+          tokenPrefix,
+          locationId,
+          collectionsSeen: (Array.isArray(collections) ? collections : []).map(
+            (c) => ({
+              name: c?.name,
+              id: extractCollectionId(c),
+            })
+          ),
         },
       });
     }
@@ -161,8 +174,8 @@ export default async function handler(req, res) {
     const created = await ghlFetch("/products/", {
       method: "POST",
       json: {
-        locationId,          // REQUIRED by your tenant
-        productType,         // REQUIRED by your tenant (default PHYSICAL)
+        locationId,
+        productType,
         name,
         description: description || undefined,
         image: image || undefined,
@@ -177,28 +190,40 @@ export default async function handler(req, res) {
       created?._id;
 
     if (!productId) {
-      throw new Error("Product created but ID missing");
+      return res.status(500).json({
+        ok: false,
+        build: BUILD_MARKER,
+        error: "Product created but ID missing in response.",
+        created,
+      });
     }
 
-    // 3) Enforce collection
+    // 3) Enforce collection assignment
+    // IMPORTANT: your tenant requires name on PUT, so include it.
     await ghlFetch(`/products/${productId}`, {
       method: "PUT",
       json: {
         locationId,
         productType,
-        collectionIds: [resolvedCollectionId],
+        name, // REQUIRED by your tenant on PUT
+        description: description || undefined,
+        image: image || undefined,
+        sku: sku || undefined,
+        collectionIds: [String(resolvedCollectionId)],
       },
     });
 
-    // 4) Verify
-    const verified = await ghlFetch(`/products/${productId}`);
+    // 4) Verify (best-effort)
+    const verified = await ghlFetch(`/products/${productId}`, { method: "GET" });
 
     return res.status(201).json({
       ok: true,
       build: BUILD_MARKER,
-      productId,
-      collectionName,
-      resolvedCollectionId,
+      productId: String(productId),
+      collection: {
+        name: collectionName,
+        id: String(resolvedCollectionId),
+      },
       debug: {
         tokenPrefix,
         locationId,
@@ -215,6 +240,7 @@ export default async function handler(req, res) {
       debug: {
         tokenPrefix,
         locationId,
+        productType,
         ghlUrl: err.url || null,
       },
     });
